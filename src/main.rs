@@ -8,10 +8,13 @@ use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSrc};
 use rtp::Frame;
 use std::env;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use writer::FrameWriter;
+
+// Buffer size for channels - allows some buffering without blocking
+const FRAME_CHANNEL_BUFFER: usize = 100;
 
 fn main() -> Result<()> {
     // Initialize logger
@@ -34,15 +37,26 @@ fn main() -> Result<()> {
     let output_dir = env::args().nth(2).unwrap_or_else(|| "frames".to_string());
     log::info!("Output directory: {}", output_dir);
 
-    // Create channel for sending frames to decoder thread
-    let (frame_tx, frame_rx) = channel::<Frame>();
+    // Create buffered channels for sending frames to worker threads
+    // Using sync_channel with buffer to prevent blocking the receiver thread
+    let (writer_tx, writer_rx) = sync_channel::<Frame>(FRAME_CHANNEL_BUFFER);
+    let (decoder_tx, decoder_rx) = sync_channel::<Frame>(FRAME_CHANNEL_BUFFER);
 
-    // Clone output_dir for decoder thread
+    // Clone output_dir for threads
+    let writer_output_dir = output_dir.clone();
     let decoder_output_dir = output_dir.clone();
 
-    // Start decoder thread
+    // Start writer thread - handles disk I/O separately
+    let writer_thread = thread::spawn(move || {
+        if let Err(e) = run_writer_thread(writer_rx, &writer_output_dir) {
+            log::error!("Writer thread error: {}", e);
+        }
+    });
+    log::info!("Writer thread started");
+
+    // Start decoder thread - handles frame decoding to images
     let decoder_thread = thread::spawn(move || {
-        if let Err(e) = run_decoder_thread(frame_rx, &decoder_output_dir) {
+        if let Err(e) = run_decoder_thread(decoder_rx, &decoder_output_dir) {
             log::error!("Decoder thread error: {}", e);
         }
     });
@@ -75,20 +89,19 @@ fn main() -> Result<()> {
 
     log::info!("AppSink configured");
 
-    // Create shared state
+    // Create shared state - only collector needs mutex, writer/decoder run in separate threads
     let collector = Arc::new(Mutex::new(FrameCollector::new()));
-    let writer = Arc::new(Mutex::new(FrameWriter::new(&output_dir)?));
 
     // Clone for callback
     let collector_clone = collector.clone();
-    let writer_clone = writer.clone();
-    let frame_tx_clone = frame_tx.clone();
+    let writer_tx_clone = writer_tx.clone();
+    let decoder_tx_clone = decoder_tx.clone();
 
-    // Set up AppSink callbacks
+    // Set up AppSink callbacks - MUST BE FAST, no blocking I/O here!
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
-                match process_sample(sink, &collector_clone, &writer_clone, &frame_tx_clone) {
+                match process_sample(sink, &collector_clone, &writer_tx_clone, &decoder_tx_clone) {
                     Ok(_) => Ok(gstreamer::FlowSuccess::Ok),
                     Err(e) => {
                         log::error!("Sample processing error: {}", e);
@@ -158,8 +171,15 @@ fn main() -> Result<()> {
         .set_state(gstreamer::State::Null)
         .map_err(|_| anyhow::anyhow!("Failed to set pipeline to Null"))?;
 
-    // Drop frame sender to signal decoder thread to finish
-    drop(frame_tx);
+    // Drop frame senders to signal worker threads to finish
+    drop(writer_tx);
+    drop(decoder_tx);
+
+    // Wait for writer thread to finish
+    log::info!("Waiting for writer thread to finish...");
+    if let Err(e) = writer_thread.join() {
+        log::error!("Writer thread panicked: {:?}", e);
+    }
 
     // Wait for decoder thread to finish
     log::info!("Waiting for decoder thread to finish...");
@@ -169,13 +189,11 @@ fn main() -> Result<()> {
 
     // Print final statistics
     let (frames, packets) = collector.lock().unwrap().get_stats();
-    let written = writer.lock().unwrap().get_frames_written();
 
     log::info!("========================================");
     log::info!("Final Statistics:");
     log::info!("  Frames completed: {}", frames);
     log::info!("  Packets received: {}", packets);
-    log::info!("  Frames written: {}", written);
     log::info!("========================================");
 
     Ok(())
@@ -184,8 +202,8 @@ fn main() -> Result<()> {
 fn process_sample(
     sink: &AppSink,
     collector: &Arc<Mutex<FrameCollector>>,
-    writer: &Arc<Mutex<FrameWriter>>,
-    frame_tx: &Sender<Frame>,
+    writer_tx: &SyncSender<Frame>,
+    decoder_tx: &SyncSender<Frame>,
 ) -> Result<()> {
     // Pull sample from appsink
     let sample = sink
@@ -204,23 +222,31 @@ fn process_sample(
 
     let data = map.as_slice();
 
-    // Parse RTP packet
+    // Parse RTP packet - FAST operation
     match rtp::RtpPacket::parse(data) {
         Ok(packet) => {
-            // Process packet through collector
+            // Process packet through collector - FAST operation
             let mut col = collector.lock().unwrap();
             if let Some(frame) = col.process_packet(packet) {
-                // Frame completed - write to disk
-                drop(col); // Release lock before writing
+                drop(col); // Release lock immediately
 
-                let mut wrt = writer.lock().unwrap();
-                if let Err(e) = wrt.write_frame(&frame) {
-                    log::error!("Failed to write frame {}: {}", frame.frame_id, e);
+                // Clone frame for decoder (both threads need it)
+                let frame_for_decoder = Frame {
+                    frame_id: frame.frame_id,
+                    rtp_timestamp: frame.rtp_timestamp,
+                    packets: frame.packets.clone(),
+                    receive_start_time: frame.receive_start_time,
+                    receive_end_time: frame.receive_end_time,
+                };
+
+                // Send to writer thread - NON-BLOCKING with buffer
+                if let Err(e) = writer_tx.try_send(frame) {
+                    log::error!("Failed to send frame to writer (channel full?): {}", e);
                 }
 
-                // Send frame to decoder thread
-                if let Err(e) = frame_tx.send(frame) {
-                    log::error!("Failed to send frame to decoder thread: {}", e);
+                // Send to decoder thread - NON-BLOCKING with buffer
+                if let Err(e) = decoder_tx.try_send(frame_for_decoder) {
+                    log::error!("Failed to send frame to decoder (channel full?): {}", e);
                 }
             }
         }
@@ -229,6 +255,32 @@ fn process_sample(
         }
     }
 
+    Ok(())
+}
+
+/// Writer thread - receives frames and writes them to disk
+fn run_writer_thread(
+    frame_rx: std::sync::mpsc::Receiver<Frame>,
+    output_dir: &str,
+) -> Result<()> {
+    log::info!("Writer thread: starting...");
+
+    let mut writer = FrameWriter::new(output_dir)?;
+    let mut frames_written = 0;
+
+    // Process frames from channel
+    while let Ok(frame) = frame_rx.recv() {
+        if let Err(e) = writer.write_frame(&frame) {
+            log::error!("Failed to write frame {}: {}", frame.frame_id, e);
+        } else {
+            frames_written += 1;
+            if frames_written % 50 == 0 {
+                log::info!("Writer thread: {} frames written", frames_written);
+            }
+        }
+    }
+
+    log::info!("Writer thread: finished, total frames written: {}", frames_written);
     Ok(())
 }
 

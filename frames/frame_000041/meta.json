@@ -1,0 +1,14 @@
+{
+  "frame_id": 41,
+  "codec": "H264",
+  "rtp_timestamp": 1859983282,
+  "sequence_start": 51326,
+  "sequence_end": 51696,
+  "packet_count": 371,
+  "receive_start_time": "2026-02-02T09:49:20.917162+00:00",
+  "receive_end_time": "2026-02-02T09:49:20.980053+00:00",
+  "receive_duration_ms": 62,
+  "packet_loss_detected": false,
+  "total_bytes": 539779,
+  "payload_bytes": 535327
+}
