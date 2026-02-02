@@ -45,7 +45,7 @@ impl FrameCollector {
             None => {
                 // Start new frame
                 self.start_new_frame(packet.clone());
-                
+
                 if packet.marker {
                     log::debug!(
                         "Single-packet frame {} (ts={})",
@@ -66,15 +66,15 @@ impl FrameCollector {
                         frame.rtp_timestamp,
                         packet.timestamp
                     );
-                    
+
                     let finished = self.finish_frame();
                     self.start_new_frame(packet.clone());
-                    
+
                     finished
                 } else {
                     // Add packet to current frame
                     frame.packets.push(packet.clone());
-                    
+
                     // Check marker bit (frame end)
                     if packet.marker {
                         log::debug!(
@@ -107,7 +107,7 @@ impl FrameCollector {
     fn start_new_frame(&mut self, packet: RtpPacket) {
         self.frame_counter += 1;
         let now = SystemTime::now();
-        
+
         log::debug!(
             "Starting frame {} (ts={}, seq={})",
             self.frame_counter,
@@ -127,18 +127,22 @@ impl FrameCollector {
     fn finish_frame(&mut self) -> Option<Frame> {
         if let Some(mut frame) = self.current_frame.take() {
             frame.receive_end_time = Some(SystemTime::now());
-            
-            let duration = frame.duration_ms().unwrap_or(0);
+
+            // let duration = frame.duration_ms().unwrap_or(0);
             log::info!(
-                "Frame {} completed: {} packets, {} ms, ts={}, seq={}-{}",
+                "Frame {}: start receive at {} end at {} with {} packets",
                 frame.frame_id,
+                frame.receive_start_time
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
                 frame.packets.len(),
-                duration,
-                frame.rtp_timestamp,
-                frame.packets.first().unwrap().sequence_number,
-                frame.packets.last().unwrap().sequence_number
             );
-            
+
             return Some(frame);
         }
         None
